@@ -1,0 +1,171 @@
+from app.services.ml_prediction_service import PredictionResult, PredictionType
+from app.utils.time import utc_now
+
+
+def _register_farmer(client, phone_number: str, district: str = "Nashik", language: str = "en"):
+    response = client.post(
+        "/farmers/register",
+        json={
+            "phone_number": phone_number,
+            "name": f"Farmer {phone_number[-4:]}",
+            "preferred_language": language,
+            "state": "Maharashtra",
+            "district": district,
+            "consent_given": True,
+            "registration_channel": "sms",
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["farmer_id"]
+
+
+def _create_plot(client, farmer_id: str, nickname: str, crop_type: str = "rice"):
+    response = client.post(
+        "/plots/create",
+        json={
+            "farmer_id": farmer_id,
+            "plot_nickname": nickname,
+            "latitude": 19.076,
+            "longitude": 72.8777,
+            "crop_type": crop_type,
+            "plot_size_declared": 1.0,
+            "sowing_date": "2024-06-15",
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["plot_id"]
+
+
+def _institutional_headers(client, district: str = "Nashik"):
+    signup = client.post(
+        "/institutional/signup",
+        json={
+            "email": f"{district.lower()}@example.com",
+            "password": "StrongPass123",
+            "role": "viewer",
+            "assigned_geography": {"districts": [district]},
+        },
+    )
+    assert signup.status_code == 201
+
+    login = client.post(
+        "/institutional/login",
+        json={"email": f"{district.lower()}@example.com", "password": "StrongPass123"},
+    )
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_dashboard_aggregates_and_trends(client):
+    plot_ids = []
+    for index in range(5):
+        farmer_id = _register_farmer(client, f"9000001{index:03d}", district="Nashik")
+        plot_id = _create_plot(client, farmer_id, f"Plot {index}")
+        plot_ids.append(plot_id)
+
+    for plot_id in plot_ids:
+        assert client.post(f"/ingest/{plot_id}").status_code == 202
+        assert client.post(f"/advisories/generate/{plot_id}").status_code == 201
+
+    headers = _institutional_headers(client, district="Nashik")
+
+    unauthorized = client.get("/dashboard/aggregates?district=Nashik&window_days=30")
+    assert unauthorized.status_code in (401, 403)
+
+    aggregates = client.get("/dashboard/aggregates?district=Nashik&window_days=30", headers=headers)
+    assert aggregates.status_code == 200
+    aggregate_data = aggregates.json()
+    assert aggregate_data["suppressed"] is False
+    assert aggregate_data["total_plots"] == 5
+    assert "alert_rate" in aggregate_data
+    assert sum(aggregate_data["summary"].values()) == 5
+
+    trends = client.get("/dashboard/trends?district=Nashik&window_days=30", headers=headers)
+    assert trends.status_code == 200
+    trend_data = trends.json()
+    assert trend_data["suppressed"] is False
+    assert len(trend_data["series"]) >= 1
+
+
+def test_sms_and_internal_orchestration(client, monkeypatch):
+    def forced_prediction(self, plot_id: str):
+        return PredictionResult(
+            prediction_id="prediction-test-2",
+            plot_id=plot_id,
+            prediction_type=PredictionType.IRRIGATION_STRESS,
+            predicted_value=19.0,
+            advisory_class="irrigate_now",
+            confidence_score=0.94,
+            reason_code="low_soil_moisture",
+            explanation={
+                "reason": "forced orchestration test",
+                "stage2_rules": {
+                    "advisory_class": "irrigate_now",
+                    "reason_code": "low_soil_moisture",
+                    "cwsi": 0.81,
+                },
+            },
+            model_version="test-v1",
+            predicted_at=utc_now(),
+        )
+
+    monkeypatch.setattr("app.services.ml_prediction_service.MLPredictionService.predict_irrigation_stress", forced_prediction)
+
+    farmer_id = _register_farmer(client, "9000012345", district="Pune")
+    plot_id = _create_plot(client, farmer_id, "SMS Plot")
+
+    send_response = client.post(
+        "/sms/send",
+        json={
+            "farmer_phone": "9000012345",
+            "message_body": "Test advisory message",
+            "advisory_id": None,
+        },
+    )
+    assert send_response.status_code == 200
+    message_id = send_response.json()["message_id"]
+
+    delivery_response = client.post(
+        "/sms/webhook/delivery",
+        json={"sms_log_id": message_id, "status": "delivered"},
+    )
+    assert delivery_response.status_code == 200
+
+    assert client.post(f"/ingest/{plot_id}").status_code == 202
+    assert client.post(f"/advisories/generate/{plot_id}").status_code == 201
+
+    inbound_response = client.post(
+        "/sms/inbound",
+        json={"farmer_phone": "9000012345", "message_body": "1"},
+    )
+    assert inbound_response.status_code == 200
+    assert inbound_response.json()["ok"] is True
+
+    internal_ingestion = client.post("/internal/ingestion/trigger")
+    assert internal_ingestion.status_code == 200
+    assert internal_ingestion.json()["status"] == "queued"
+
+    internal_retraining = client.post("/internal/retraining/run")
+    assert internal_retraining.status_code == 200
+    assert internal_retraining.json()["feedback_records_seen"] >= 1
+
+
+def test_inbound_sms_clarifies_unrecognized_or_unmatched_feedback(client):
+    _register_farmer(client, "9000099999", district="Pune")
+
+    unmatched = client.post(
+        "/sms/inbound",
+        json={"farmer_phone": "9000099999", "message_body": "1"},
+    )
+    assert unmatched.status_code == 200
+    assert unmatched.json()["ok"] is False
+    assert "72 hours" in unmatched.json()["message"]
+
+    unrecognized = client.post(
+        "/sms/inbound",
+        json={"farmer_phone": "9000099999", "message_body": "9"},
+    )
+    assert unrecognized.status_code == 200
+    assert unrecognized.json()["ok"] is False
+    assert "Unrecognized reply" in unrecognized.json()["message"]
