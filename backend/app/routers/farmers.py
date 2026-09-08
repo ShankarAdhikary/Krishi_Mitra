@@ -40,11 +40,11 @@ def _is_owner_session(session_token: str | None, farmer: Farmer) -> bool:
     return payload.get("farmer_id") == farmer.farmer_id and payload.get("phone_number") == farmer.phone_number
 
 
-def _mask_farmer(farmer: Farmer, *, anonymized: bool = False) -> Farmer:
+def _mask_farmer(farmer: Farmer, *, anonymized: bool = False, include_name: bool = False) -> Farmer:
     return Farmer(
         farmer_id=farmer.farmer_id,
         phone_number=(f"ANON{farmer.farmer_id.replace('-', '')[:11]}" if anonymized else "REDACTED"),
-        name=(None if anonymized else None),
+        name=(farmer.name if include_name and not anonymized else None),
         preferred_language=farmer.preferred_language,
         state=None,
         district=None,
@@ -145,7 +145,9 @@ def get_farmer_by_phone_number(phone_number: str, session_token: str | None = No
         raise HTTPException(status_code=404, detail="Farmer not found")
     if farmer.status != "active":
         raise HTTPException(status_code=403, detail="Farmer account is not active")
-    return farmer if _is_owner_session(session_token, farmer) else farmer
+    # Never expose a phone number through a lookup endpoint without proving
+    # ownership.  This endpoint is commonly called with untrusted user input.
+    return farmer if _is_owner_session(session_token, farmer) else _mask_farmer(farmer, include_name=True)
 
 
 @router.delete("/{farmer_id}")

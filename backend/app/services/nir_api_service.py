@@ -8,10 +8,30 @@ from typing import Any
 import time
 
 import httpx
+from prometheus_client import Counter, Histogram
 
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+NIR_API_REQUESTS = Counter(
+    "nir_api_requests_total",
+    "NIR API requests by endpoint and outcome.",
+    ("path", "outcome"),
+)
+NIR_API_REQUEST_DURATION = Histogram(
+    "nir_api_request_duration_seconds",
+    "NIR API request duration by endpoint and attempt.",
+    ("path",),
+)
+NIR_API_CONFIDENCE_NORMALIZATIONS = Counter(
+    "nir_api_confidence_normalizations_total",
+    "NIR API percentage confidence values normalized to decimals.",
+)
+NIR_API_CIRCUIT_OPENS = Counter(
+    "nir_api_circuit_opens_total",
+    "NIR API circuit-breaker openings.",
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +105,7 @@ class NirApiService:
 
     def _request(self, path: str, payload: Any) -> Any:
         if time.monotonic() < self._circuit_open_until:
+            NIR_API_REQUESTS.labels(path=path, outcome="circuit_open").inc()
             logger.warning("NIR API circuit open until %.0f (monotonic)", self._circuit_open_until)
             raise NirApiError("NIR API circuit is open after repeated failures")
         last_error: Exception | None = None
@@ -120,9 +141,12 @@ class NirApiService:
                     attempt + 1,
                     list(payload.keys()) if isinstance(payload, dict) else None,
                 )
+                NIR_API_REQUEST_DURATION.labels(path=path).observe(latency)
+                NIR_API_REQUESTS.labels(path=path, outcome="success").inc()
                 return body
             except (httpx.HTTPError, ValueError) as exc:
                 latency = time.monotonic() - start
+                NIR_API_REQUEST_DURATION.labels(path=path).observe(latency)
                 last_error = exc
                 logger.warning(
                     "NIR API request error path=%s attempt=%d latency=%.3fs error=%s",
@@ -137,11 +161,13 @@ class NirApiService:
         self._consecutive_failures += 1
         if self._consecutive_failures >= 5:
             self._circuit_open_until = time.monotonic() + 3600
+            NIR_API_CIRCUIT_OPENS.inc()
             logger.warning(
                 "NIR API circuit opened due to %d consecutive failures; will remain open until %.0f (monotonic)",
                 self._consecutive_failures,
                 self._circuit_open_until,
             )
+        NIR_API_REQUESTS.labels(path=path, outcome="error").inc()
         logger.error(
             "NIR API request failed after 3 attempts; last_error=%s payload_keys=%s",
             last_error,
@@ -190,6 +216,7 @@ class NirApiService:
         if 0 <= confidence <= 1:
             return confidence
         if 1 < confidence <= 100:
+            NIR_API_CONFIDENCE_NORMALIZATIONS.inc()
             logger.info("Normalizing NIR API confidence from percentage %s to decimal", confidence)
             return confidence / 100
         logger.debug("NIR API returned out-of-range confidence: %s", confidence)

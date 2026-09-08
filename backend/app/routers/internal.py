@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -12,12 +12,18 @@ router = APIRouter(prefix="/internal", tags=["internal"])
 
 
 @router.post("/ingestion/trigger")
-def trigger_ingestion(db: Session = Depends(get_db)) -> dict[str, object]:
+def trigger_ingestion(
+    use_mock: bool = Query(
+        False,
+        description="Use generated data instead of configured live ingestion providers.",
+    ),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     plots = db.query(Plot).filter(Plot.status == "active").all()
     service = IngestionService(db)
     ingested = 0
     for plot in plots:
-        ingested += len(service.fetch_plot_cycle(plot.plot_id, use_mock=True))
+        ingested += len(service.fetch_plot_cycle(plot.plot_id, use_mock=use_mock))
     return {"status": "queued", "message": "Ingestion cycle completed", "plots_processed": len(plots), "records_ingested": ingested}
 
 
@@ -73,7 +79,9 @@ def generate_advisory(db: Session = Depends(get_db)) -> dict[str, object]:
                 messaging = MessagingService(db)
                 try:
                     messaging.ensure_sms_capacity(farmer.farmer_id)
-                    sms_service.log_sms_send(advisory.advisory_id, farmer.farmer_id, message.message_text)
+                    sms_service.log_sms_send(
+                        advisory.advisory_id, farmer.farmer_id, farmer.phone_number, message.message_text
+                    )
                     if prediction.advisory_class == "irrigate_now":
                         messaging.send_ivr(farmer.phone_number, message.message_text)
                         advisory.ivr_triggered = True

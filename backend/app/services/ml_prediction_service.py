@@ -1,21 +1,18 @@
 """
 ML Prediction Service -- sec 12.4
 
-Two-stage pipeline:
-  Stage 1 -- Regression (XGBoost/LightGBM or weak-label fallback)
-             -> Soil Moisture %, CWSI
-  Stage 2 -- Rule-based Decision Layer (explainable, independently versioned)
-             -> No Action / Monitor / Irrigate Soon / Irrigate Now
-             + reason_code + confidence
+Primary pipeline:
+  NIR API -- seven validated inputs -> NIR %, urgency, and advice
 
-Both stages are kept as clearly separated modules so they can be evaluated
-and versioned independently (sec 12.4.1).
+Legacy Stage 1 + Stage 2 remain available as a safety fallback during the
+agreed transition period.
 
 Every prediction records model_version for audit / evaluation-runs tracing (sec 12.4.2).
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,10 +21,13 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models import MlPrediction, Plot
+from app.models import MlPrediction, Plot, PlotFeatures
 from app.services.feature_engineering_service import FeatureEngineeringService
+from app.services.nir_api_service import NirApiError, NirApiService
 from app.services.water_balance_model import IrrigationStress, WaterBalanceBucketModel
 from app.utils.time import utc_now
+
+logger = logging.getLogger(__name__)
 
 
 class PredictionType(str, Enum):
@@ -209,9 +209,9 @@ class AdvisoryDecisionEngine:
 
 class MLPredictionService:
     """
-    Orchestrate Stage 1 -> Stage 2 pipeline (sec 12.2 /advise endpoint).
+    Orchestrate NIR API predictions with a legacy model fallback.
 
-    Stage 1 output is always inspectable independently via /soil-moisture endpoint.
+    Stage 1 output remains inspectable independently via /soil-moisture endpoint.
     Every prediction carries model_version for audit tracing (sec 12.4.2).
     """
 
@@ -222,6 +222,7 @@ class MLPredictionService:
         self._stage1 = SoilMoistureModel(db)
         self._stage2 = AdvisoryDecisionEngine(db)
         self._features_service = FeatureEngineeringService(db)
+        self._nir_api = NirApiService()
 
     # ---- Stage 1 only (for /soil-moisture endpoint) ----
 
@@ -232,11 +233,59 @@ class MLPredictionService:
     # ---- Full two-stage pipeline (for /advise endpoint) ----
 
     def predict_irrigation_stress(self, plot_id: str) -> PredictionResult:
-        """Run Stage 1 + Stage 2 and return the combined advisory result."""
+        """Use the NIR API primarily, with the legacy model as a safety fallback."""
         stage1 = self._stage1.predict(plot_id)
+
+        nir_input, input_fallback_reason = self._build_nir_input(plot_id, stage1)
+        if nir_input is not None:
+            try:
+                nir = self._nir_api.predict(nir_input)
+                urgency_map = {
+                    "URGENT": ("irrigate_now", "urgent_irrigation_needed", 0.95),
+                    "MODERATE": ("irrigate_soon", "monitor_and_prepare", 0.70),
+                    "SAFE": ("no_action", "safe_no_irrigation", 0.50),
+                }
+                advisory_class, reason_code, urgency_confidence = urgency_map[nir.urgency]
+                return PredictionResult(
+                    prediction_id=str(uuid.uuid4()),
+                    plot_id=plot_id,
+                    prediction_type=PredictionType.IRRIGATION_STRESS,
+                    predicted_value=nir.nir,
+                    advisory_class=advisory_class,
+                    confidence_score=(
+                        nir.confidence
+                        if nir.confidence is not None
+                        else urgency_confidence
+                    ),
+                    reason_code=reason_code,
+                    explanation={
+                        "provider": "nir_api",
+                        "nir_percent": nir.nir,
+                        "advice": nir.advice,
+                        "urgency": nir.urgency,
+                        "confidence": nir.confidence,
+                        "nir_request": nir.request,
+                        "fallback_used": False,
+                        "fallback_reason": None,
+                        "stage1_soil_moisture_pct": stage1.soil_moisture_pct,
+                    },
+                    model_version=nir.model_version,
+                    predicted_at=utc_now(),
+                )
+            except NirApiError as exc:
+                # The existing two-stage model is the agreed 30-day safety net.
+                logger.warning(
+                    "NIR API unavailable for plot %s; using legacy fallback: %s",
+                    plot_id,
+                    exc,
+                )
+
         decision = self._stage2.decide(stage1)
 
         explanation = {
+            "provider": "legacy_fallback",
+            "fallback_used": True,
+            "fallback_reason": input_fallback_reason or "NIR API request failed",
             **stage1.feature_snapshot,
             "stage2_rules": {
                 "advisory_class": decision.advisory_class,
@@ -264,6 +313,60 @@ class MLPredictionService:
             model_version=self.MODEL_VERSION,
             predicted_at=utc_now(),
         )
+
+    def _build_nir_input(
+        self, plot_id: str, stage1: SoilMoistureResult
+    ) -> tuple[dict | None, str | None]:
+        """Build the agreed seven-field request from the latest canonical row."""
+        plot = self.db.query(Plot).filter(Plot.plot_id == plot_id).first()
+        features = self.db.query(PlotFeatures).filter(
+            PlotFeatures.plot_id == plot_id
+        ).order_by(PlotFeatures.obs_date.desc()).first()
+        if not plot:
+            return None, "plot not found"
+        if not features:
+            logger.warning("No canonical features available for plot %s", plot_id)
+            return None, "canonical features unavailable"
+        if features.et0 is None:
+            logger.warning("ET0 unavailable for plot %s", plot_id)
+            return None, "ET0 unavailable"
+        if features.lst is None:
+            logger.warning("Temperature unavailable for plot %s", plot_id)
+            return None, "temperature unavailable"
+
+        crop_stage_map = {
+            "seedling": 1,
+            "vegetative": 1,
+            "flowering": 2,
+            "pod_fill": 3,
+            "mature": 3,
+        }
+        crop_stage = crop_stage_map.get((features.crop_stage or "").lower(), 2)
+        soil_type = (plot.soil_texture or "").strip().lower()
+        # The NIR contract accepts agronomic soil classes rather than every
+        # database texture label. Vidarbha black cotton soil is the pilot
+        # default; unknown values remain explicit instead of being guessed.
+        soil_type = {
+            "black cotton": "black",
+            "black cotton soil": "black",
+            "medium black": "black",
+            "red": "red",
+            "red soil": "red",
+            "sandy": "sandy",
+            "sandy loam": "sandy",
+            "clay": "clay",
+            "clayey": "clay",
+            "loam": "loamy",
+        }.get(soil_type, soil_type or "unknown")
+        return {
+            "soil_moisture": max(0.0, min(100.0, stage1.soil_moisture_pct)),
+            "temperature": max(-10.0, min(60.0, float(features.lst))),
+            "rainfall": max(0.0, float(features.rainfall_7d or 0.0)),
+            "et0": max(0.0, float(features.et0)),
+            "crop_stage": crop_stage,
+            "crop": plot.crop_type,
+            "soil_type": soil_type,
+        }, None
 
     def save_prediction(self, result: PredictionResult) -> MlPrediction:
         """Save prediction to the database for audit and model evaluation (sec 12.4.2)."""

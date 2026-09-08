@@ -10,7 +10,7 @@ POST /ingest/water-balance-labels/{plot_id} -- run water-balance label job for a
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -24,21 +24,29 @@ legacy_router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
 @router.post("/{plot_id}", status_code=status.HTTP_202_ACCEPTED)
 @legacy_router.post("/trigger/{plot_id}", status_code=status.HTTP_202_ACCEPTED)
-def trigger_ingestion(plot_id: str, db: Session = Depends(get_db)) -> dict:
+def trigger_ingestion(
+    plot_id: str,
+    use_mock: bool = Query(
+        False,
+        description="Use generated data instead of configured live ingestion providers.",
+    ),
+    db: Session = Depends(get_db),
+) -> dict:
     """
     Trigger satellite data ingestion for a plot.
 
     sec 12.2 / 12.3.1: writes to plot_features using the "nearest valid
     observation per source" date-snapping join logic (11.4), not a naive
     same-day merge.  Cloud/quality masking + outlier rejection applied
-    before feature computation (sec 12.3.3).
+    before feature computation (sec 12.3.3).  Live ingestion is the default;
+    pass ``use_mock=true`` only for local tests or demos.
     """
     plot = db.query(Plot).filter(Plot.plot_id == plot_id).first()
     if not plot:
         raise HTTPException(status_code=404, detail="Plot not found")
 
     service = IngestionService(db)
-    data = service.fetch_plot_cycle(plot_id, use_mock=True)
+    data = service.fetch_plot_cycle(plot_id, use_mock=use_mock)
 
     if data is None:
         raise HTTPException(status_code=500, detail="Failed to fetch satellite data")

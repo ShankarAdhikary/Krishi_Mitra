@@ -313,7 +313,7 @@ def test_satellite_data_ingestion(client):
     plot_id = plot_response.json()["plot_id"]
 
     # Trigger ingestion
-    trigger_response = client.post(f"/ingest/{plot_id}")
+    trigger_response = client.post(f"/ingest/{plot_id}?use_mock=true")
     assert trigger_response.status_code == 202
     data = trigger_response.json()
     assert data["status"] == "ingestion_triggered"
@@ -362,7 +362,7 @@ def test_history_command_returns_last_three_advisories(client):
     session_token = session_response.json()["session_token"]
 
     for _ in range(4):
-        assert client.post(f"/ingest/{plot_id}").status_code == 202
+        assert client.post(f"/ingest/{plot_id}?use_mock=true").status_code == 202
         assert client.post(f"/advisories/generate/{plot_id}").status_code == 201
 
     response = client.post(

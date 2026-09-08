@@ -1,11 +1,16 @@
 from datetime import timedelta
+import base64
+import hashlib
+import hmac
 import uuid
+from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.core.config import get_settings
 from app.models import AdvisoryFeedback, MlPrediction, SmsLog
 from app.routers.commands import parse_command
 from app.routers.farmers import get_farmer_by_phone
@@ -40,6 +45,11 @@ class IvrRequest(BaseModel):
     script: str | None = None
 
 
+class WhatsAppSendRequest(BaseModel):
+    farmer_phone: str
+    message_body: str
+
+
 FEEDBACK_WINDOW_HOURS = 72
 FEEDBACK_REPLY_MAP = {"1": "irrigated", "2": "not_needed", "3": "crop_damaged"}
 
@@ -47,7 +57,7 @@ FEEDBACK_REPLY_MAP = {"1": "irrigated", "2": "not_needed", "3": "crop_damaged"}
 @router.post("/send")
 def send_sms(payload: SmsSendRequest | None = None, db: Session = Depends(get_db)) -> dict[str, str]:
     if payload is None or not payload.farmer_phone or not payload.message_body:
-        return {"status": "queued", "provider": "mock"}
+        return {"status": "queued", "provider": get_settings().sms_provider}
 
     farmer = get_farmer_by_phone(db, payload.farmer_phone)
     if not farmer:
@@ -55,14 +65,15 @@ def send_sms(payload: SmsSendRequest | None = None, db: Session = Depends(get_db
 
     MessagingService(db).ensure_sms_capacity(farmer.farmer_id)
 
+    result = MessagingService(db).send_sms(farmer.phone_number, payload.message_body)
     sms_log = SmsLog(
-        sms_log_id=payload.gateway_message_id or str(uuid.uuid4()),
+        sms_log_id=str(uuid.uuid4()),
         advisory_id=payload.advisory_id,
         farmer_id=farmer.farmer_id,
         direction="outbound",
         message_body=payload.message_body,
-        gateway_message_id=payload.gateway_message_id,
-        delivery_status="queued",
+        gateway_message_id=result.get("message_id") or payload.gateway_message_id,
+        delivery_status=result.get("status", "queued"),
         retry_count=0,
         sent_at=utc_now(),
     )
@@ -71,15 +82,61 @@ def send_sms(payload: SmsSendRequest | None = None, db: Session = Depends(get_db
 
     return {
         "status": "queued",
-        "provider": "mock",
+        "provider": result.get("gateway", get_settings().sms_provider),
         "message_id": sms_log.sms_log_id,
         "recipient": farmer.phone_number,
     }
 
 
+@router.post("/whatsapp/send")
+def send_whatsapp(payload: WhatsAppSendRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    farmer = get_farmer_by_phone(db, payload.farmer_phone)
+    if not farmer:
+        raise HTTPException(status_code=404, detail="Farmer not found")
+    MessagingService(db).ensure_sms_capacity(farmer.farmer_id)
+    result = MessagingService(db).send_whatsapp(farmer.phone_number, payload.message_body)
+    log = SmsLog(
+        sms_log_id=str(uuid.uuid4()), farmer_id=farmer.farmer_id, direction="outbound",
+        message_body=payload.message_body, gateway_message_id=result.get("message_id"),
+        delivery_status=result.get("status", "queued"), retry_count=0, sent_at=utc_now(),
+    )
+    db.add(log)
+    db.commit()
+    return {"status": log.delivery_status, "provider": result.get("gateway", get_settings().sms_provider),
+            "message_id": log.sms_log_id, "gateway_message_id": log.gateway_message_id or ""}
+
+
+def _verify_twilio_signature(request: Request, body: bytes) -> None:
+    settings = get_settings()
+    if settings.sms_provider.lower() != "twilio":
+        return
+    signature = request.headers.get("X-Twilio-Signature")
+    if not signature or not settings.twilio_auth_token:
+        raise HTTPException(status_code=403, detail="Invalid Twilio webhook signature")
+    params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    expected = hmac.new(
+        settings.twilio_auth_token.encode("utf-8"),
+        (str(request.url) + "".join(f"{key}{params[key]}" for key in sorted(params))).encode("utf-8"),
+        hashlib.sha1,
+    ).digest()
+    if not hmac.compare_digest(signature, base64.b64encode(expected).decode("ascii")):
+        raise HTTPException(status_code=403, detail="Invalid Twilio webhook signature")
+
+
 @router.post("/webhook/delivery")
-def delivery_webhook(payload: DeliveryReceiptRequest | None = None, db: Session = Depends(get_db)) -> dict[str, str]:
-    if payload is None:
+async def delivery_webhook(request: Request, db: Session = Depends(get_db)) -> dict[str, str]:
+    body = await request.body()
+    _verify_twilio_signature(request, body)
+    content_type = request.headers.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type:
+        values = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+        payload = DeliveryReceiptRequest(
+            gateway_message_id=values.get("MessageSid") or values.get("SmsSid"),
+            status=values.get("MessageStatus") or values.get("SmsStatus") or "delivered",
+        )
+    elif body:
+        payload = DeliveryReceiptRequest.model_validate_json(body)
+    else:
         return {"status": "received"}
 
     query = db.query(SmsLog)
@@ -94,8 +151,11 @@ def delivery_webhook(payload: DeliveryReceiptRequest | None = None, db: Session 
     if not sms_log:
         raise HTTPException(status_code=404, detail="SMS log not found")
 
-    sms_log.delivery_status = payload.status
-    if payload.status == "delivered":
+    status_map = {"queued": "queued", "accepted": "queued", "sending": "queued",
+                  "sent": "sent", "delivered": "delivered", "failed": "failed",
+                  "undelivered": "failed", "canceled": "failed"}
+    sms_log.delivery_status = status_map.get(payload.status.lower(), "failed")
+    if sms_log.delivery_status == "delivered":
         sms_log.delivered_at = utc_now()
     db.commit()
 
@@ -199,5 +259,7 @@ def inbound_sms(payload: InboundSmsRequest | None = None, db: Session = Depends(
 @router.post("/ivr")
 def trigger_ivr(payload: IvrRequest | None = None) -> dict[str, str]:
     if payload is None or not payload.farmer_phone:
-        return {"status": "queued", "provider": "mock"}
-    return {"status": "queued", "provider": "mock", "recipient": payload.farmer_phone}
+        return {"status": "queued", "provider": get_settings().ivr_provider}
+    result = MessagingService().send_ivr(payload.farmer_phone, payload.script or "")
+    return {"status": result.get("status", "queued"), "provider": result.get("gateway", get_settings().ivr_provider),
+            "recipient": payload.farmer_phone, "message_id": result.get("message_id", "")}

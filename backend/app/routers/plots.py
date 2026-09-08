@@ -81,7 +81,11 @@ def create_plot(payload: PlotCreate, db: Session = Depends(get_db)) -> Plot:
         plot_id=str(uuid.uuid4()),
         farmer_id=payload.farmer_id,
         plot_nickname=payload.plot_nickname or f"Plot {len(farmer.plots) + 1}",
-        location_point=None,
+        location_point=(
+            f"POINT ({payload.longitude} {payload.latitude})"
+            if payload.latitude is not None and payload.longitude is not None
+            else None
+        ),
         location_precision=location_precision,
         village_name=payload.village_name,
         buffer_polygon=buffer_polygon_wkt,

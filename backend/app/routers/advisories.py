@@ -82,6 +82,7 @@ def generate_and_send_advisory(plot_id: str, db: Session = Depends(get_db)) -> d
             sms_service.log_sms_send(
                 advisory_id=advisory.advisory_id,
                 farmer_id=farmer.farmer_id,
+                farmer_phone=farmer.phone_number,
                 message_text=message.message_text,
             )
             if prediction.advisory_class == "irrigate_now":
@@ -105,6 +106,9 @@ def generate_and_send_advisory(plot_id: str, db: Session = Depends(get_db)) -> d
                     "sms_status": "suppressed_quota",
                     "model_version": saved_pred.model_version,
                     "stage1_soil_moisture_pct": float(saved_pred.stage1_soil_moisture_estimate) if saved_pred.stage1_soil_moisture_estimate is not None else None,
+                    "nir_percent": (prediction.explanation or {}).get("nir_percent"),
+                    "urgency": (prediction.explanation or {}).get("urgency"),
+                    "fallback_used": (prediction.explanation or {}).get("fallback_used", False),
                 }
             raise
 
@@ -121,6 +125,9 @@ def generate_and_send_advisory(plot_id: str, db: Session = Depends(get_db)) -> d
         "sms_status": "sent" if should_send else "not_sent_no_action",
         "model_version": saved_pred.model_version,
         "stage1_soil_moisture_pct": float(saved_pred.stage1_soil_moisture_estimate) if saved_pred.stage1_soil_moisture_estimate is not None else None,
+        "nir_percent": (prediction.explanation or {}).get("nir_percent"),
+        "urgency": (prediction.explanation or {}).get("urgency"),
+        "fallback_used": (prediction.explanation or {}).get("fallback_used", False),
     }
 
 

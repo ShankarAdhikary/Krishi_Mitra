@@ -42,3 +42,18 @@ def test_request_validation_is_structured(client) -> None:
     assert data["detail"] == "Request validation failed"
     assert data["error"]["details"]
     assert response.headers["x-request-id"]
+
+
+def test_health_ready_alias(client) -> None:
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    assert response.json()["checks"]["database"] == "ok"
+
+
+def test_plot_validation_rejects_partial_coordinates(client) -> None:
+    response = client.post(
+        "/plots/create",
+        json={"farmer_id": "missing", "crop_type": "cotton", "latitude": 20.1},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"

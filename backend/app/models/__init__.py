@@ -239,6 +239,29 @@ class Advisory(Base):
     feedback: Mapped[list["AdvisoryFeedback"]] = relationship(back_populates="advisory")
 
 
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    alert_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    advisory_id: Mapped[str] = mapped_column(ForeignKey("advisories.advisory_id"), unique=True, nullable=False)
+    plot_id: Mapped[str] = mapped_column(ForeignKey("plots.plot_id"), nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    trigger_metric: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    trigger_value: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    threshold: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="GENERATED", nullable=False)
+    assigned_user_id: Mapped[str | None] = mapped_column(ForeignKey("institutional_users.user_id"), nullable=True)
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    advisory: Mapped[Advisory] = relationship()
+    plot: Mapped[Plot] = relationship()
+
+
 class SmsLog(Base):
     __tablename__ = "sms_logs"
 
@@ -326,6 +349,7 @@ __all__ = [
     "Advisory",
     "SmsLog",
     "AdvisoryFeedback",
+    "Alert",
     "SmsConversationSession",
     "SupportedLanguage",
     "InstitutionalUser",

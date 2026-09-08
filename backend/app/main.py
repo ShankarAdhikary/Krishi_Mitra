@@ -3,14 +3,18 @@ import time
 import uuid
 
 from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import HTTPException
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import SessionLocal
+from app.core.config import get_settings
 
 from app.routers import (
     advisories,
@@ -19,6 +23,9 @@ from app.routers import (
     farmers,
     ingestion,
     institutional_auth,
+    institutional_plots,
+    alerts,
+    operations,
     internal,
     messages,
     model_monitoring,
@@ -42,6 +49,19 @@ app = FastAPI(
         "FPR-constrained model evaluation and canonical plot_features store."
     ),
 )
+configured_origins = {
+    origin.strip()
+    for origin in get_settings().frontend_allowed_origins.split(",")
+    if origin.strip()
+}
+configured_origins.update({"http://localhost:3000", "http://127.0.0.1:3000"})
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(configured_origins),
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # Existing routers
 app.include_router(farmers.router)
@@ -52,6 +72,9 @@ app.include_router(ingestion.legacy_router)  # backwards-compatible /ingestion/t
 app.include_router(predictions.router)
 app.include_router(advisories.router)
 app.include_router(institutional_auth.router)
+app.include_router(institutional_plots.router)
+app.include_router(alerts.router)
+app.include_router(operations.router)
 app.include_router(messages.router)
 app.include_router(internal.router)
 app.include_router(dashboard.router)
@@ -128,7 +151,7 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
         "error": {
             "code": "request_validation_error",
             "message": "Request validation failed",
-            "details": exc.errors(),
+            "details": jsonable_encoder(exc.errors()),
         },
         "detail": "Request validation failed",
         "request_id": request_id,
@@ -136,19 +159,29 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
     return JSONResponse(status_code=422, content=payload, headers={"x-request-id": request_id})
 
 
-@app.get("/health")
+@app.get("/health", summary="Liveness probe")
+@app.get("/health/live", summary="Liveness probe", include_in_schema=False)
 def health_check() -> dict[str, str]:
     return {"status": "ok", "service": "crop-advisory-backend"}
 
 
-@app.get("/ready")
+@app.get("/ready", summary="Readiness probe")
+@app.get("/health/ready", summary="Readiness probe", include_in_schema=False)
 def readiness_check() -> dict[str, object]:
     """Readiness includes a real database connectivity check."""
     db = SessionLocal()
     try:
         db.execute(text("SELECT 1"))
     except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning("database_not_ready", exc_info=True)
         raise HTTPException(status_code=503, detail="Database not ready") from exc
     finally:
         db.close()
     return {"status": "ready", "checks": {"database": "ok"}}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    """Expose Prometheus metrics for operational monitoring."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

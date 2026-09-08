@@ -46,6 +46,9 @@ class AsyncTransportTestClient:
     def delete(self, url: str, **kwargs):
         return self.request("DELETE", url, **kwargs)
 
+    def patch(self, url: str, **kwargs):
+        return self.request("PATCH", url, **kwargs)
+
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 
 

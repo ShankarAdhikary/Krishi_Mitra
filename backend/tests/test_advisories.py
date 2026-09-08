@@ -30,7 +30,7 @@ def test_generate_advisory_skips_sms_for_no_action(client):
     )
     plot_id = plot_response.json()["plot_id"]
 
-    ingest_response = client.post(f"/ingest/{plot_id}")
+    ingest_response = client.post(f"/ingest/{plot_id}?use_mock=true")
     assert ingest_response.status_code == 202
 
     advisory_response = client.post(f"/advisories/generate/{plot_id}")

@@ -1,3 +1,4 @@
+from app.models import MlPrediction
 from app.services.ml_prediction_service import PredictionResult, PredictionType
 from app.utils.time import utc_now
 
@@ -57,7 +58,7 @@ def _institutional_headers(client, district: str = "Nashik"):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_dashboard_aggregates_and_trends(client):
+def test_dashboard_aggregates_and_trends(client, db_session):
     plot_ids = []
     for index in range(5):
         farmer_id = _register_farmer(client, f"9000001{index:03d}", district="Nashik")
@@ -65,8 +66,17 @@ def test_dashboard_aggregates_and_trends(client):
         plot_ids.append(plot_id)
 
     for plot_id in plot_ids:
-        assert client.post(f"/ingest/{plot_id}").status_code == 202
-        assert client.post(f"/advisories/generate/{plot_id}").status_code == 201
+        assert client.post(f"/ingest/{plot_id}?use_mock=true").status_code == 202
+        advisory = client.post(f"/advisories/generate/{plot_id}")
+        assert advisory.status_code == 201
+        prediction = db_session.query(MlPrediction).filter(
+            MlPrediction.prediction_id == advisory.json()["prediction_id"]
+        ).one()
+        prediction.input_feature_snapshot = {
+            "provider": "nir_api",
+            "nir_percent": 10.0 + len(plot_ids),
+        }
+    db_session.commit()
 
     headers = _institutional_headers(client, district="Nashik")
 
@@ -79,6 +89,8 @@ def test_dashboard_aggregates_and_trends(client):
     assert aggregate_data["suppressed"] is False
     assert aggregate_data["total_plots"] == 5
     assert "alert_rate" in aggregate_data
+    assert aggregate_data["nri_percent"] == 15.0
+    assert aggregate_data["nri_plot_count"] == 5
     assert sum(aggregate_data["summary"].values()) == 5
 
     trends = client.get("/dashboard/trends?district=Nashik&window_days=30", headers=headers)
@@ -132,7 +144,7 @@ def test_sms_and_internal_orchestration(client, monkeypatch):
     )
     assert delivery_response.status_code == 200
 
-    assert client.post(f"/ingest/{plot_id}").status_code == 202
+    assert client.post(f"/ingest/{plot_id}?use_mock=true").status_code == 202
     assert client.post(f"/advisories/generate/{plot_id}").status_code == 201
 
     inbound_response = client.post(
@@ -142,7 +154,7 @@ def test_sms_and_internal_orchestration(client, monkeypatch):
     assert inbound_response.status_code == 200
     assert inbound_response.json()["ok"] is True
 
-    internal_ingestion = client.post("/internal/ingestion/trigger")
+    internal_ingestion = client.post("/internal/ingestion/trigger?use_mock=true")
     assert internal_ingestion.status_code == 200
     assert internal_ingestion.json()["status"] == "queued"
 

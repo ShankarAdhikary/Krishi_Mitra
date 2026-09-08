@@ -8,6 +8,7 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.models import Advisory, SmsLog, SmsTemplate
+from app.services.messaging_service import MessagingService
 from app.utils.time import utc_now
 
 
@@ -83,6 +84,24 @@ class SMSTemplateService:
             "irrigate_now",
             "आपकी फसल को तुरंत सिंचाई की जरूरत है। आज ही सिंचाई करें।",
             "Your crop needs immediate irrigation. Water it today.",
+        ),
+        (
+            "safe_no_irrigation",
+            "no_action",
+            "सिंचाई की जरूरत नहीं है। मिट्टी में पर्याप्त नमी है।",
+            "No irrigation is needed now. Soil moisture is sufficient.",
+        ),
+        (
+            "monitor_and_prepare",
+            "irrigate_soon",
+            "मिट्टी की नमी कम हो रही है। अगले 2-3 दिन में सिंचाई की तैयारी करें।",
+            "Soil moisture is declining. Prepare to irrigate in the next 2-3 days.",
+        ),
+        (
+            "urgent_irrigation_needed",
+            "irrigate_now",
+            "फसल को तुरंत सिंचाई की जरूरत है। आज ही सिंचाई करें।",
+            "Your crop needs urgent irrigation. Water it today.",
         ),
     )
 
@@ -172,18 +191,20 @@ class SMSTemplateService:
         self,
         advisory_id: str,
         farmer_id: str,
+        farmer_phone: str,
         message_text: str,
         external_id: str | None = None,
     ) -> SmsLog:
         """Log SMS send attempt."""
+        result = MessagingService(self.db).send_sms(farmer_phone, message_text)
         sms_log = SmsLog(
             sms_log_id=str(uuid.uuid4()),
             advisory_id=advisory_id,
             farmer_id=farmer_id,
             direction="outbound",
             message_body=message_text,
-            gateway_message_id=external_id,
-            delivery_status="sent",
+            gateway_message_id=external_id or result.get("message_id"),
+            delivery_status=result.get("status", "queued"),
             retry_count=0,
             sent_at=utc_now(),
         )

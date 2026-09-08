@@ -26,6 +26,7 @@ MANIFEST
 venv/
 env/
 ENV/
+node_modules/
 
 # Testing / coverage
 .pytest_cache/

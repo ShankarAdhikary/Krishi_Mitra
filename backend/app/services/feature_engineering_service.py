@@ -167,11 +167,16 @@ class FeatureEngineeringService:
         )
 
         if not recent_data:
-            return 1.0
+            # No raw Sentinel-2 rows means there is no measured cloud penalty.
+            # Canonical features may still be available from an upstream
+            # ingestion job, so treat missing raw audit rows as neutral quality.
+            return 0.0
 
         cloud_coverages = [float(d.cloud_coverage) for d in recent_data if d.cloud_coverage is not None]
         if not cloud_coverages:
-            return 1.0
+            # The provider already filters Sentinel-2 scenes by cloud cover.
+            # Missing metadata therefore means no measurable penalty, not 100%.
+            return 0.0
 
         avg_coverage = sum(cloud_coverages) / len(cloud_coverages)
         return avg_coverage / 100.0  # Normalize to 0-1

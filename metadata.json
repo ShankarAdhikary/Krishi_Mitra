@@ -1,0 +1,6 @@
+{
+  "name": "Agricultural Intelligence & Farmer Monitoring System",
+  "description": "Government of India Agricultural Intelligence and Decision Support System integrating GIS, Satellite NIR/NDVI, weather, soil, risk engine, alerts, field inspection, and AI agronomic insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

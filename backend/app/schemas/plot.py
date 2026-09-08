@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class PlotCreate(BaseModel):
@@ -10,8 +10,20 @@ class PlotCreate(BaseModel):
     location_precision: str = "gps"
     village_name: str | None = None
     crop_type: str = Field(..., min_length=2)
-    plot_size_declared: float | None = None
+    plot_size_declared: float | None = Field(default=None, gt=0, le=10000)
     sowing_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_location(self) -> "PlotCreate":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("Latitude and longitude must be provided together")
+        if self.latitude is not None and not (-90 <= self.latitude <= 90):
+            raise ValueError("Latitude must be between -90 and 90")
+        if self.longitude is not None and not (-180 <= self.longitude <= 180):
+            raise ValueError("Longitude must be between -180 and 180")
+        if self.latitude is None and not self.village_name:
+            raise ValueError("Latitude/longitude or village fallback is required")
+        return self
 
 
 class PlotRead(BaseModel):
